@@ -1,0 +1,6 @@
+.env
+node_modules/
+chrome-profile/
+tmp-profile-check/
+farm.log
+data/farm-state.json

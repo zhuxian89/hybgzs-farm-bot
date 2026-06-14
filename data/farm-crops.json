@@ -1,0 +1,139 @@
+{
+  "source": "https://cdk.hybgzs.com/entertainment/farm/codex",
+  "updatedAt": "2026-06-13",
+  "crops": [
+    {
+      "name": "胡萝卜",
+      "type": "normal",
+      "seedPrice": 1,
+      "growHours": 0.5,
+      "yield": 2
+    },
+    {
+      "name": "番茄",
+      "type": "normal",
+      "seedPrice": 2,
+      "growHours": 1,
+      "yield": 5
+    },
+    {
+      "name": "玉米",
+      "type": "normal",
+      "seedPrice": 0.5,
+      "growHours": 1.5,
+      "yield": 25
+    },
+    {
+      "name": "南瓜",
+      "type": "normal",
+      "seedPrice": 4,
+      "growHours": 2,
+      "yield": 6
+    },
+    {
+      "name": "蓝莓",
+      "type": "normal",
+      "seedPrice": 1.5,
+      "growHours": 3,
+      "yield": 30
+    },
+    {
+      "name": "草莓",
+      "type": "normal",
+      "seedPrice": 8,
+      "growHours": 4,
+      "yield": 6
+    },
+    {
+      "name": "西瓜",
+      "type": "normal",
+      "seedPrice": 12,
+      "growHours": 6,
+      "yield": 8
+    },
+    {
+      "name": "芒果",
+      "type": "normal",
+      "seedPrice": 5,
+      "growHours": 7,
+      "yield": 35
+    },
+    {
+      "name": "黄金麦穗",
+      "type": "normal",
+      "seedPrice": 24,
+      "growHours": 20,
+      "yield": 30
+    },
+    {
+      "name": "翡翠卷心菜",
+      "type": "normal",
+      "seedPrice": 32,
+      "growHours": 24,
+      "yield": 25
+    },
+    {
+      "name": "火龙果",
+      "type": "vip",
+      "seedPrice": 20,
+      "growHours": 8,
+      "yield": 4
+    },
+    {
+      "name": "杨桃",
+      "type": "vip",
+      "seedPrice": 30,
+      "growHours": 10,
+      "yield": 10
+    },
+    {
+      "name": "榴莲",
+      "type": "vip",
+      "seedPrice": 10,
+      "growHours": 12,
+      "yield": 25
+    },
+    {
+      "name": "金苹果",
+      "type": "vip",
+      "seedPrice": 60,
+      "growHours": 12,
+      "yield": 6
+    },
+    {
+      "name": "玉露蓝玫瑰",
+      "type": "vip",
+      "seedPrice": 50,
+      "growHours": 24,
+      "yield": 8
+    },
+    {
+      "name": "水晶葡萄",
+      "type": "vip",
+      "seedPrice": 16,
+      "growHours": 30,
+      "yield": 10
+    },
+    {
+      "name": "彩虹凤梨",
+      "type": "vip",
+      "seedPrice": 100,
+      "growHours": 72,
+      "yield": 12
+    },
+    {
+      "name": "月光花",
+      "type": "vip",
+      "seedPrice": 30,
+      "growHours": 48,
+      "yield": 10
+    },
+    {
+      "name": "七日彩莲",
+      "type": "vip",
+      "seedPrice": 200,
+      "growHours": 168,
+      "yield": 20
+    }
+  ]
+}

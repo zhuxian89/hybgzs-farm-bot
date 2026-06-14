@@ -1,0 +1,15 @@
+{
+  "name": "hybgzs-farm-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "chrome": "node scripts/start-chrome.js",
+    "farm": "node scripts/farm-bot.js",
+    "farm:watch": "node scripts/farm-bot.js --watch",
+    "farm:install": "npm install"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "chrome": {
+    "debugPort": 9222,
+    "chromePath": null,
+    "cdpOrigin": null
+  },
+  "timing": {
+    "stepTimeoutMs": 45000,
+    "manualTimeoutMs": 600000,
+    "cdpCommandTimeoutMs": 15000,
+    "intervalMinutes": 10,
+    "matureBufferSeconds": 120,
+    "actionRetryMinutes": 3,
+    "failureRetrySeconds": 10,
+    "uiWaitAttempts": 5,
+    "uiWaitSeconds": 10
+  },
+  "retries": {
+    "plantAttempts": 3,
+    "sellAttempts": 2
+  },
+  "strategy": {
+    "plantCrop": "auto",
+    "maxSeedPrice": 8,
+    "recalcAfterSuccessfulPlantRounds": 6,
+    "keepSeedStock": 9
+  }
+}
