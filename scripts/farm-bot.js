@@ -10,6 +10,7 @@ const RECYCLE_URL = 'https://cdk.hybgzs.com/entertainment/farm/recycle';
 const DATA_DIR = path.join(projectRoot, 'data');
 const FARM_CROPS_FILE = path.join(projectRoot, 'data', 'farm-crops.json');
 const FARM_STATE_FILE = path.join(projectRoot, 'data', 'farm-state.json');
+const WATCH_LOCK_FILE = path.join(DATA_DIR, 'farm-watch.lock');
 const AUTH_URL_PATTERN = /\/login|linux\.do|accounts\.google\.com|oauth2/i;
 const SECURITY_TEXT_PATTERN = /安全验证|Cloudflare|Just a moment|Checking your browser|请稍候|正在检查/i;
 const SPEND_CONFIRM_PATTERN = /花费|消耗|支付|扣除|购买|买入|余额|金币|积分|确定购买|确认购买|是否购买|是否消耗|是否花费/i;
@@ -31,6 +32,8 @@ const actionRetryMinutes = Number(farmConfig.timing.actionRetryMinutes);
 const actionRetryMs = Math.max(1, actionRetryMinutes) * 60 * 1000;
 const failureRetrySeconds = Number(farmConfig.timing.failureRetrySeconds);
 const failureRetryMs = Math.max(1, failureRetrySeconds) * 1000;
+const heartbeatMinutes = Math.max(1, Number(farmConfig.timing.heartbeatMinutes || 60));
+const heartbeatMs = heartbeatMinutes * 60 * 1000;
 const plantRetryAttempts = Math.max(1, Number(farmConfig.retries.plantAttempts));
 const sellRetryAttempts = Math.max(1, Number(farmConfig.retries.sellAttempts));
 const uiWaitAttempts = Math.max(1, Number(farmConfig.timing.uiWaitAttempts));
@@ -41,6 +44,47 @@ const strategyRecalcRounds = Math.max(1, Number(farmConfig.strategy.recalcAfterS
 const keepSeedStock = Math.max(0, Number(farmConfig.strategy.keepSeedStock));
 const farmCrops = loadFarmCrops(FARM_CROPS_FILE);
 const cropNamePatternSource = farmCrops.map((crop) => escapeRegExp(crop.name)).join('|');
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireWatchLock() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (fs.existsSync(WATCH_LOCK_FILE)) {
+    const existingPid = Number(fs.readFileSync(WATCH_LOCK_FILE, 'utf8').trim());
+    if (isProcessAlive(existingPid)) {
+      throw new Error(`已有 farm:watch 实例正在运行，PID ${existingPid}。如果确认它已失效，请删除 ${WATCH_LOCK_FILE} 后重试。`);
+    }
+  }
+
+  fs.writeFileSync(WATCH_LOCK_FILE, `${process.pid}\n`, { flag: 'w' });
+  const release = () => {
+    try {
+      if (fs.existsSync(WATCH_LOCK_FILE) && fs.readFileSync(WATCH_LOCK_FILE, 'utf8').trim() === String(process.pid)) {
+        fs.unlinkSync(WATCH_LOCK_FILE);
+      }
+    } catch {
+      // 退出时清理锁失败不影响主流程。
+    }
+  };
+  process.once('exit', release);
+  process.once('SIGINT', () => {
+    release();
+    process.exit(130);
+  });
+  process.once('SIGTERM', () => {
+    release();
+    process.exit(143);
+  });
+  return release;
+}
 
 function loadFarmCrops(filePath) {
   const content = fs.readFileSync(filePath, 'utf8');
@@ -1232,8 +1276,14 @@ async function getFarmStatus(page) {
     growing,
     emptySlots,
     crops: [...new Set(cropMatches)],
-    nextRemaining: remainingMatches.find((value) => value !== '现在可收获') || remainingMatches[0] || null
+    nextRemaining: getFirstPlotRemaining(remainingMatches)
   };
+}
+
+function getFirstPlotRemaining(remainingMatches) {
+  // 永远使用第一块地的剩余时间
+  // 这样所有地块最终会自然同步到一起成熟
+  return remainingMatches.find((value) => value !== '现在可收获') || remainingMatches[0] || null;
 }
 
 function describeFarmStatus(status) {
@@ -1926,6 +1976,7 @@ function formatDuration(ms) {
 
 async function main() {
   log(`连接专用 Chrome：${CDP_ORIGIN}`);
+  const releaseWatchLock = watchMode && !testSellCropName ? acquireWatchLock() : null;
   let page = await getOrCreatePage();
   let forceFreshPage = false;
   let consecutiveFailures = 0;
@@ -1935,35 +1986,49 @@ async function main() {
       await runSellDiagnostic(page, testSellCropName, testSellQuantity);
     } else if (watchMode) {
       log(`进入常驻模式：优先按作物剩余时间等待；解析不到时每 ${intervalMinutes} 分钟检查一次。按 Ctrl+C 停止。`);
-      while (true) {
-        let result = null;
-        let failed = false;
-        try {
-          if (!page) {
-            page = await getOrCreatePage({ fresh: forceFreshPage });
-            forceFreshPage = false;
-          }
-          result = await runFarmOnce(page);
-          consecutiveFailures = 0;
-        } catch (error) {
-          failed = true;
-          consecutiveFailures += 1;
-          console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
-          if (consecutiveFailures >= 3) {
-            await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n${failureRetrySeconds} 秒后会打开新标签页，并从主页重新开始。`);
-          }
-          await page?.close().catch(() => {});
-          page = null;
-          forceFreshPage = true;
-        }
 
-        const delayMs = getNextDelayMs(result?.status, { failed, noCrop: result?.noCrop });
-        const nextRunAt = new Date(Date.now() + delayMs);
-        log(`等待下一轮：${formatDuration(delayMs)}后，${formatNextRun(nextRunAt)}`);
-        if (result) {
-          await notify(`本轮检查完成。\n收获：${result.harvested ? '成功' : '本轮无可收获'}\n种植：${result.planted ? `成功种植${result.plantCrop}` : result.noCrop ? `候选作物无库存，等待补货` : '本轮未种植'}\n卖出：${describeSellResults(result.sellResults)}\n${describeStrategy(result.strategy)}\n${describeFarmStatus(result.status)}\n下次检查：${formatNextRun(nextRunAt)}`);
+      // 启动心跳监测，频率只影响 Telegram Ping，不影响收获检查。
+      const heartbeatInterval = setInterval(async () => {
+        const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+        await notify(`🟢 心跳 Ping - ${now}`);
+      }, heartbeatMs);
+
+      log(`心跳监测已启动：每 ${heartbeatMinutes} 分钟发送一次 Ping 到 Telegram`);
+
+      try {
+        while (true) {
+          let result = null;
+          let failed = false;
+          try {
+            if (!page) {
+              page = await getOrCreatePage({ fresh: forceFreshPage });
+              forceFreshPage = false;
+            }
+            result = await runFarmOnce(page);
+            consecutiveFailures = 0;
+          } catch (error) {
+            failed = true;
+            consecutiveFailures += 1;
+            console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
+            if (consecutiveFailures >= 3) {
+              await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n${failureRetrySeconds} 秒后会打开新标签页，并从主页重新开始。`);
+            }
+            await page?.close().catch(() => {});
+            page = null;
+            forceFreshPage = true;
+          }
+
+          const delayMs = getNextDelayMs(result?.status, { failed, noCrop: result?.noCrop });
+          const nextRunAt = new Date(Date.now() + delayMs);
+          log(`等待下一轮：${formatDuration(delayMs)}后，${formatNextRun(nextRunAt)}`);
+          if (result) {
+            await notify(`本轮检查完成。\n收获：${result.harvested ? '成功' : '本轮无可收获'}\n种植：${result.planted ? `成功种植${result.plantCrop}` : result.noCrop ? `候选作物无库存，等待补货` : '本轮未种植'}\n卖出：${describeSellResults(result.sellResults)}\n${describeStrategy(result.strategy)}\n${describeFarmStatus(result.status)}\n下次检查：${formatNextRun(nextRunAt)}`);
+          }
+          await sleep(delayMs);
         }
-        await sleep(delayMs);
+      } finally {
+        clearInterval(heartbeatInterval);
+        log('心跳监测已停止');
       }
     } else {
       let result;
@@ -1979,6 +2044,7 @@ async function main() {
       await notify(`单次流程结束。\n收获：${result.harvested ? '成功' : '本轮无可收获'}\n种植：${result.planted ? `成功种植${result.plantCrop}` : result.noCrop ? `候选作物无库存，等待补货` : '本轮未种植'}\n卖出：${describeSellResults(result.sellResults)}\n${describeStrategy(result.strategy)}\n${describeFarmStatus(result.status)}`);
     }
   } finally {
+    releaseWatchLock?.();
     await page.close();
   }
 }

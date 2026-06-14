@@ -22,7 +22,8 @@ const defaultConfig = {
     actionRetryMinutes: 3,
     failureRetrySeconds: 10,
     uiWaitAttempts: 5,
-    uiWaitSeconds: 10
+    uiWaitSeconds: 10,
+    heartbeatMinutes: 60
   },
   retries: {
     plantAttempts: 3,
