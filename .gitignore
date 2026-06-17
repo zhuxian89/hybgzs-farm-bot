@@ -6,3 +6,4 @@ farm.log
 data/farm-state.json
 data/farm-watch.lock
 logs/*.log
+farm-config.local.json

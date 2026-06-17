@@ -131,16 +131,26 @@ function saveFarmState(state) {
   fs.writeFileSync(FARM_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
 }
 
-function rankCropsByProfit(crops, exchangePrices) {
+function rankCropsByProfit(crops, exchangePrices, totalSlots = 1) {
+  // totalSlots: 地块数量，用于计算实际收益（考虑留种）
+  // 默认值1 用于向后兼容
   return crops
     .map((crop) => {
       const sellPrice = exchangePrices[crop.name];
       if (!Number.isFinite(sellPrice)) return null;
+
+      // 新算法：每轮收获 = 产量 × 地块数，卖出 = 收获 - 留种
+      const harvestPerRound = crop.yield * totalSlots;
+      const sellPerRound = harvestPerRound - totalSlots;  // 留种
+      const incomePerHour = sellPerRound * sellPrice;
+      const roundsPerDay = 24 / crop.growHours;
+      const dailyIncome = incomePerHour * roundsPerDay;
+
+      // 保留旧字段用于兼容（用于显示每小时利润）
       const revenue = crop.yield * sellPrice;
       const profit = revenue - crop.seedPrice;
       const profitPerHour = profit / crop.growHours;
-      const roundsPerDay = 24 / crop.growHours;
-      const dailyProfit = profit * roundsPerDay;
+
       return {
         ...crop,
         sellPrice,
@@ -149,11 +159,15 @@ function rankCropsByProfit(crops, exchangePrices) {
         profit,
         profitPerHour,
         roundsPerDay,
-        dailyProfit
+        // 新增字段
+        harvestPerRound,
+        sellPerRound,
+        incomePerHour,
+        dailyIncome  // 实际每天收入（考虑留种）
       };
     })
     .filter(Boolean)
-    .sort((a, b) => b.dailyProfit - a.dailyProfit);
+    .sort((a, b) => b.dailyIncome - a.dailyIncome);  // 按实际收入排序
 }
 
 function getStaticPlantCropName() {
@@ -207,7 +221,7 @@ function serializeRanking(ranking) {
     profit: roundMoney(item.profit),
     profitPerHour: roundMoney(item.profitPerHour),
     roundsPerDay: roundMoney(item.roundsPerDay),
-    dailyProfit: roundMoney(item.dailyProfit)
+    dailyIncome: roundMoney(item.dailyIncome)
   }));
 }
 
@@ -244,7 +258,7 @@ function describeStrategy(strategy) {
   const lines = [`策略：${strategy.mode === 'auto' ? '自动选择' : '固定作物'}，当前目标 ${strategy.selectedCrop}`];
   if (strategy.recalculated && strategy.ranking?.length) {
     const top = strategy.ranking.slice(0, 3)
-      .map((item) => `${item.name} ${roundMoney(item.dailyProfit || 0)}/天`)
+      .map((item) => `${item.name} ${roundMoney(item.dailyIncome)}/天`)
       .join('，');
     lines.push(`收益前三：${top}`);
   }
@@ -257,12 +271,15 @@ function log(message) {
 }
 
 async function notify(message) {
-  const token = process.env.TG_BOT_TOKEN;
-  const chatId = process.env.TG_CHAT_ID;
+  // 优先使用配置文件，fallback 到环境变量
+  const token = farmConfig.telegram?.botToken || process.env.TG_BOT_TOKEN;
+  const chatId = farmConfig.telegram?.chatId || process.env.TG_CHAT_ID;
+  const timeoutMs = farmConfig.telegram?.timeoutMs || 20000;
+
   if (!token || !chatId) return;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -381,18 +398,32 @@ async function ensureDedicatedChrome() {
 }
 
 class CdpPage {
-  constructor(wsUrl) {
+  constructor(wsUrl, targetId = null) {
     this.wsUrl = wsUrl;
+    this.targetId = targetId;
     this.nextId = 1;
     this.pending = new Map();
     this.allowedSpendConfirm = null;
     this.unusable = false;
+    this.reconnecting = false;
+    this.heartbeatInterval = null;
   }
 
   async connect() {
+    // 清理旧的心跳
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+
     this.ws = new WebSocket(this.wsUrl);
     this.ws.on('close', () => {
       this.rejectAllPending(new Error('CDP WebSocket 已关闭'));
+      // 清理心跳
+      if (this.heartbeatInterval) {
+        clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = null;
+      }
     });
     this.ws.on('error', (error) => {
       this.rejectAllPending(new Error(`CDP WebSocket 错误：${error.message}`));
@@ -446,11 +477,64 @@ class CdpPage {
     await this.send('Page.enable');
     await this.send('Runtime.enable');
     await this.send('DOM.enable');
+
+    // 启动心跳保活（每 30 秒）
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.send('Browser.getVersion').catch(() => {
+          log('心跳失败，WebSocket 可能已断开');
+        });
+      }
+    }, 30000);
+
+    log('WebSocket 已连接，心跳保活已启动');
   }
 
-  send(method, params = {}) {
+  async reconnect() {
+    if (this.reconnecting) {
+      log('重连已在进行中，跳过');
+      return;
+    }
+
+    this.reconnecting = true;
+    log('WebSocket 断开，尝试重连...');
+
+    try {
+      // 清理旧连接
+      if (this.ws) {
+        this.ws.removeAllListeners();
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.close();
+        }
+      }
+
+      // 等待一小段时间
+      await sleep(1000);
+
+      // 重新连接
+      await this.connect();
+      this.unusable = false;
+      log('WebSocket 重连成功');
+    } catch (error) {
+      log(`WebSocket 重连失败: ${error.message}`);
+      throw error;
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  async send(method, params = {}) {
+    // 如果未连接，尝试重连
     if (this.ws?.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error(`CDP WebSocket 未连接，无法执行 ${method}`));
+      if (!this.reconnecting) {
+        try {
+          await this.reconnect();
+        } catch (error) {
+          return Promise.reject(new Error(`重连失败，无法执行 ${method}: ${error.message}`));
+        }
+      } else {
+        return Promise.reject(new Error(`WebSocket 重连中，暂时无法执行 ${method}`));
+      }
     }
 
     const id = this.nextId++;
@@ -542,10 +626,26 @@ class CdpPage {
     return this.evaluate('document.body ? document.body.innerText : ""');
   }
 
-  async close() {
+  async disconnect() {
+    // 清理心跳
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+      log('心跳保活已停止');
+    }
+
     this.rejectAllPending(new Error('CDP 页面连接已主动关闭'));
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.close();
+    }
+  }
+
+  async close() {
+    await this.disconnect();
+    if (this.targetId) {
+      await fetchJson(`${CDP_ORIGIN}/json/close/${this.targetId}`).catch((error) => {
+        log(`关闭 Chrome 标签页失败：${error.message}`);
+      });
     }
   }
 }
@@ -553,7 +653,7 @@ class CdpPage {
 async function newPage(url = HOME_URL) {
   await ensureDedicatedChrome();
   const tab = await fetchJson(`${CDP_ORIGIN}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-  const page = new CdpPage(tab.webSocketDebuggerUrl);
+  const page = new CdpPage(tab.webSocketDebuggerUrl, tab.id);
   await page.connect();
   return page;
 }
@@ -573,7 +673,7 @@ async function getOrCreatePage({ fresh = false } = {}) {
     tab = await fetchJson(`${CDP_ORIGIN}/json/new?${encodeURIComponent(HOME_URL)}`, { method: 'PUT' });
   }
 
-  const page = new CdpPage(tab.webSocketDebuggerUrl);
+  const page = new CdpPage(tab.webSocketDebuggerUrl, tab.id);
   await page.connect();
   return page;
 }
@@ -1559,11 +1659,19 @@ async function readProfitRankingFromRecycle(page) {
     const prices = await readExchangePrices(page);
     return Object.keys(prices).length > 0 ? prices : null;
   });
-  const ranking = rankCropsByProfit(getAllowedPlantCrops(), exchangePrices);
+
+  // 回到农场获取地块数
+  await reenterFarmPage(page, '读取地块数量');
+  const farmStatus = await getFarmStatus(page);
+  const totalSlots = farmStatus.totalSlots || 1;  // 默认1块地
+
+  log(`当前地块数：${totalSlots}，基于此计算作物收益排名`);
+
+  const ranking = rankCropsByProfit(getAllowedPlantCrops(), exchangePrices, totalSlots);
   if (!ranking.length) {
     throw new Error('交易所没有读到可用于收益计算的普通作物价格。');
   }
-  return { exchangePrices, ranking };
+  return { exchangePrices, ranking, totalSlots };
 }
 
 async function resolvePlantStrategy(page) {
@@ -1602,7 +1710,7 @@ async function resolvePlantStrategy(page) {
     farmState.lastExchangePrices = exchangePrices;
     farmState.lastProfitRanking = serializeRanking(ranking);
     saveFarmState(farmState);
-    log(`自动策略重算完成：${selectedCrop}。收益前三：${ranking.slice(0, 3).map((item) => `${item.name} ${roundMoney(item.dailyProfit)}/天`).join('，')}`);
+    log(`自动策略重算完成：${selectedCrop}。收益前三：${ranking.slice(0, 3).map((item) => `${item.name} ${roundMoney(item.dailyIncome)}/天`).join('，')}`);
     return {
       mode: 'auto',
       selectedCrop,
@@ -1676,6 +1784,10 @@ async function setCropQuantityInQuickSell(page, cropName, quantity) {
     };
     const inputs = Array.from(document.querySelectorAll('input[type="number"]')).filter(visible);
 
+    // 找到最接近的、只包含目标作物的输入框（文本最短 = 最接近）
+    let bestMatch = null;
+    let shortestText = Infinity;
+
     for (const input of inputs) {
       let cursor = input;
       for (let depth = 0; cursor && depth < 8; depth += 1) {
@@ -1695,21 +1807,46 @@ async function setCropQuantityInQuickSell(page, cropName, quantity) {
 
         if (match) {
           const stock = Number(match[1]);
-          if (quantity < 0 || quantity > stock) return { selected: false, stock, quantity, reason: 'quantity-out-of-range' };
-          input.scrollIntoView({ block: 'center', inline: 'center' });
-          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-          if (setter) setter.call(input, String(quantity));
-          else input.value = String(quantity);
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          input.dispatchEvent(new Event('blur', { bubbles: true }));
-          return { selected: true, stock, quantity };
+          // 优先选择文本最短的（最接近的父元素，避免选到包含多个作物的容器）
+          if (text.length < shortestText) {
+            shortestText = text.length;
+            bestMatch = { input, stock };
+          }
         }
         cursor = cursor.parentElement;
       }
     }
 
-    return { selected: false, stock: null, quantity, reason: 'crop-input-not-found' };
+    if (!bestMatch) {
+      return { selected: false, stock: null, quantity, reason: 'crop-input-not-found' };
+    }
+
+    const { input, stock } = bestMatch;
+
+    if (quantity < 0 || quantity > stock) return { selected: false, stock, quantity, reason: 'quantity-out-of-range' };
+
+    // 滚动到可见区域
+    input.scrollIntoView({ block: 'center', inline: 'center' });
+
+    // 先聚焦
+    input.focus();
+
+    // 清空现有值
+    input.value = '';
+
+    // 设置新值（使用原生 setter 触发 React 更新）
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, String(quantity));
+    else input.value = String(quantity);
+
+    // 触发 React 事件
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // 失焦
+    input.blur();
+
+    return { selected: true, stock, quantity };
   })()`);
 }
 
@@ -1787,6 +1924,9 @@ async function sellCropIfNeeded(page, cropName, options = {}) {
   if (!selected.selected) {
     throw new Error(`快速卖出弹窗没有找到可设置数量的${cropName}行：${JSON.stringify(selected)}`);
   }
+
+  // 等待页面更新（重要：给页面时间处理事件和更新显示）
+  await sleep(5000);  // 增加到5秒，确保大数值有足够时间更新
 
   let lastSelection = null;
   try {
@@ -2010,12 +2150,38 @@ async function main() {
             failed = true;
             consecutiveFailures += 1;
             console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
-            if (consecutiveFailures >= 3) {
-              await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n${failureRetrySeconds} 秒后会打开新标签页，并从主页重新开始。`);
+
+            // 判断错误类型
+            const isWebSocketError = error.message.includes('WebSocket') || error.message.includes('CDP');
+            const isPageError = error.message.includes('等待超时') || error.message.includes('未找到');
+
+            if (isWebSocketError && consecutiveFailures < 3) {
+              // WebSocket 错误：尝试重连，不关闭页面
+              log('检测到 WebSocket 错误，尝试重连而不创建新标签页');
+              try {
+                await page?.reconnect();
+                log('WebSocket 重连成功，将在下一轮继续使用当前页面');
+                // 不设置 forceFreshPage，继续使用当前页面
+              } catch (reconnectError) {
+                log(`WebSocket 重连失败: ${reconnectError.message}，将创建新标签页`);
+                await page?.close().catch(() => {});
+                page = null;
+                forceFreshPage = true;
+              }
+            } else if (consecutiveFailures >= 5) {
+              // 连续失败 5 次：创建新标签页
+              log('连续失败 5 次，创建新标签页重新开始');
+              await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n创建新标签页重新开始`);
+              await page?.close().catch(() => {});
+              page = null;
+              forceFreshPage = true;
+            } else {
+              // 其他错误或少量失败：保留页面，下一轮重试
+              log(`保留当前页面，${failureRetrySeconds} 秒后重试`);
+              if (consecutiveFailures >= 3) {
+                await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n保留当前页面，继续重试`);
+              }
             }
-            await page?.close().catch(() => {});
-            page = null;
-            forceFreshPage = true;
           }
 
           const delayMs = getNextDelayMs(result?.status, { failed, noCrop: result?.noCrop });
@@ -2045,7 +2211,7 @@ async function main() {
     }
   } finally {
     releaseWatchLock?.();
-    await page.close();
+    await page?.disconnect();
   }
 }
 

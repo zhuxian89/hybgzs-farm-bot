@@ -4,6 +4,11 @@
     "chromePath": null,
     "cdpOrigin": null
   },
+  "telegram": {
+    "botToken": "",
+    "chatId": "",
+    "timeoutMs": 20000
+  },
   "timing": {
     "stepTimeoutMs": 45000,
     "manualTimeoutMs": 600000,

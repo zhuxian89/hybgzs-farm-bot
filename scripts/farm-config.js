@@ -74,8 +74,17 @@ function loadFarmConfig(filePath = FARM_CONFIG_FILE) {
   if (!fs.existsSync(filePath)) return defaultConfig;
 
   try {
-    const localConfig = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    return mergeConfig(defaultConfig, localConfig);
+    const baseConfig = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    let merged = mergeConfig(defaultConfig, baseConfig);
+
+    // 尝试加载本地配置（包含敏感信息）
+    const localConfigPath = path.join(projectRoot, 'farm-config.local.json');
+    if (fs.existsSync(localConfigPath)) {
+      const localConfig = JSON.parse(fs.readFileSync(localConfigPath, 'utf8'));
+      merged = mergeConfig(merged, localConfig);
+    }
+
+    return merged;
   } catch (error) {
     throw new Error(`读取配置文件失败：${filePath}。${error.message}`);
   }

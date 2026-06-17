@@ -10,7 +10,7 @@ npm install
 
 ## 运行
 
-直接运行：
+### 单次运行
 
 ```bash
 npm run farm
@@ -18,11 +18,45 @@ npm run farm
 
 如果专用 Chrome 没开，脚本会自动打开。首次使用时，在打开的 Chrome 里手动完成 Cloudflare、安全验证、LinuxDo/Google 登录和授权；脚本会等待并继续。
 
-常驻重复检查：
+### 常驻模式（推荐）
+
+**⚠️ 重要：使用启动脚本，避免启动多个实例！**
 
 ```bash
-npm run farm:watch
+# 推荐：使用启动脚本（自动处理停止、清理、验证）
+./start.sh
 ```
+
+**启动脚本会自动：**
+1. 停止现有进程
+2. 清理锁文件
+3. 启动新进程
+4. 验证只有1个实例运行
+
+**手动启动（不推荐，容易启动多个）**：
+
+```bash
+# 如果必须手动启动，请严格按顺序执行：
+pkill -f "farm-bot.js"
+sleep 2
+rm -f data/farm-watch.lock
+nohup node scripts/farm-bot.js --watch > logs/farm-watch.log 2> logs/farm-watch.err.log &
+```
+
+**检查运行状态**：
+
+```bash
+# 查看运行中的进程
+ps aux | grep farm-bot | grep -v grep
+
+# 查看日志
+tail -f logs/farm-watch.log
+```
+
+**防止多实例机制**：
+- 脚本内置锁文件保护（`data/farm-watch.lock`）
+- 启动脚本自动验证只有1个实例
+- 如果已有实例运行，新的启动会自动失败并提示
 
 常驻模式会优先读取页面里的 `剩余` 时间，等到成熟后再加 120 秒缓冲执行下一轮。读取不到剩余时间时，才使用固定间隔。
 
