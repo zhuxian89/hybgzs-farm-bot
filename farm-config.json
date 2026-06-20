@@ -28,7 +28,6 @@
   "strategy": {
     "plantCrop": "auto",
     "maxSeedPrice": 8,
-    "recalcAfterSuccessfulPlantRounds": 6,
-    "keepSeedStock": 9
+    "recalcAfterSuccessfulPlantRounds": 6
   }
 }

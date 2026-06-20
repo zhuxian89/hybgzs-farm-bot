@@ -33,7 +33,6 @@ const defaultConfig = {
     plantCrop: 'auto',
     maxSeedPrice: 8,
     recalcAfterSuccessfulPlantRounds: 6,
-    keepSeedStock: 6
   }
 };
 

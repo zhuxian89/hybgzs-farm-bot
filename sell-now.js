@@ -1,16 +1,13 @@
 #!/usr/bin/env node
 /**
  * 立即触发售卖（不导航版本）
- * 前提：浏览器已经打开交易所页面 https://farm.linux.do/recycle
+ * 前提：浏览器已经打开交易所页面 https://cdk.hybgzs.com/entertainment/farm/recycle
  */
 
 import WebSocket from 'ws';
-import { readFileSync } from 'fs';
 
 const CDP_ORIGIN = 'http://127.0.0.1:9222';
-
-const config = JSON.parse(readFileSync('./farm-config.json', 'utf-8'));
-const keepSeedStock = config.strategy.keepSeedStock;
+const FARM_URL = 'https://cdk.hybgzs.com/entertainment/farm';
 
 function log(message) {
   console.log(`[sell-now] ${message}`);
@@ -92,26 +89,50 @@ async function connectPage() {
   });
 }
 
+async function readTotalSlotsFromFarm(page) {
+  // 先记住当前 URL
+  const currentUrl = await page.evaluate('window.location.href');
+
+  // 如果不在农场页面，先导航过去
+  if (!currentUrl.includes('/farm')) {
+    log('导航到农场页面读取地块数...');
+    await page.evaluate(`window.location.href = ${JSON.stringify(FARM_URL)}`);
+    await sleep(5000);
+  }
+
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    const bodyText = await page.evaluate('document.body?.innerText || ""');
+    const plantedMatch = bodyText.match(/已种植[:：]\s*\d+\s*\/\s*(\d+)/);
+    if (plantedMatch) {
+      const totalSlots = Number(plantedMatch[1]);
+      log(`从农场页面读取到地块数：${totalSlots}`);
+      return totalSlots;
+    }
+    if (attempt < 10) {
+      log(`获取地块数失败（第 ${attempt}/10 次），重试...`);
+      await sleep(2000);
+    }
+  }
+
+  throw new Error('连续 10 次无法从农场页面获取地块数');
+}
+
 async function main() {
-  log(`立即触发售卖，每种作物保留 ${keepSeedStock} 个`);
   log('请确保浏览器已打开交易所页面');
 
   const page = await connectPage();
   log('已连接到浏览器');
 
   try {
-    // 检查当前页面
+    // 读取地块数
+    const keepSeedStock = await readTotalSlotsFromFarm(page);
+    log(`立即触发售卖，每种作物保留 ${keepSeedStock} 个（= 地块数）`);
+
+    // 如果之前导航到了农场页面，现在跳转到交易所
     const url = await page.evaluate('window.location.href');
-    log(`当前页面: ${url}`);
-
-    if (!url.includes('/farm/')) {
-      throw new Error('当前不在农场页面，请手动打开交易所页面');
-    }
-
-    // 如果不在交易所，导航过去
     if (!url.includes('/recycle')) {
-      log('不在交易所页面，跳转到交易所...');
-      await page.evaluate('window.location.href = window.location.origin + window.location.pathname.replace(/\\/[^\\/]*$/, "/recycle")');
+      log('跳转到交易所...');
+      await page.evaluate(`window.location.href = ${JSON.stringify('https://cdk.hybgzs.com/entertainment/farm/recycle')}`);
       await sleep(5000);
     }
 
@@ -140,7 +161,7 @@ async function main() {
       );
       if (!sellBtn) return { error: '未找到快速卖出按钮' };
       sellBtn.click();
-      await sleep(3000);  // 增加等待时间
+      await sleep(3000);
 
       // 等待弹窗加载
       log('等待快速卖出弹窗加载...');
@@ -214,7 +235,6 @@ async function main() {
         for (const row of allRows) {
           const text = normalize(row.innerText || row.textContent);
 
-          // 检查是否包含作物名和库存信息
           if (text.includes(crop.name) && text.includes('库存')) {
             const inputs = Array.from(row.querySelectorAll('input[type="number"]')).filter(visible);
 
@@ -243,11 +263,9 @@ async function main() {
       // 确认卖出
       log('点击「确认卖出」...');
 
-      // 调试：列出所有按钮
       const allButtons = Array.from(document.querySelectorAll('button')).map(b => b.innerText.trim());
       log('页面上的所有按钮: ' + allButtons.join(', '));
 
-      // 检查底部状态
       const statusText = document.body.innerText;
       const selectedMatch = statusText.match(/已选\\s*(\\d+)\\s*种\\s*\\/\\s*(\\d+)\\s*个/);
       if (selectedMatch) {

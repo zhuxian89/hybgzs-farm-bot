@@ -41,7 +41,6 @@ const uiWaitIntervalMs = Math.max(1, Number(farmConfig.timing.uiWaitSeconds)) * 
 const configuredPlantCrop = String(farmConfig.strategy.plantCrop || AUTO_PLANT_CROP).trim();
 const maxSeedPrice = Number(farmConfig.strategy.maxSeedPrice);
 const strategyRecalcRounds = Math.max(1, Number(farmConfig.strategy.recalcAfterSuccessfulPlantRounds));
-const keepSeedStock = Math.max(0, Number(farmConfig.strategy.keepSeedStock));
 const farmCrops = loadFarmCrops(FARM_CROPS_FILE);
 const cropNamePatternSource = farmCrops.map((crop) => escapeRegExp(crop.name)).join('|');
 
@@ -278,6 +277,14 @@ async function notify(message) {
 
   if (!token || !chatId) return;
 
+  // Telegram 单条消息限制 4096 字符
+  const MAX_TG_LEN = 4000;
+  const prefix = '[farm-bot]\n';
+  let text = `${prefix}${message}`;
+  if (text.length > MAX_TG_LEN) {
+    text = text.slice(0, MAX_TG_LEN - 3) + '...';
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -288,12 +295,13 @@ async function notify(message) {
       signal: controller.signal,
       body: JSON.stringify({
         chat_id: chatId,
-        text: `[farm-bot]\n${message}`
+        text: text
       })
     });
 
     if (!response.ok) {
-      log(`Telegram 通知失败：HTTP ${response.status}`);
+      const body = await response.text().catch(() => '');
+      log(`Telegram 通知失败：HTTP ${response.status} ${body.slice(0, 200)}`);
     }
   } catch (error) {
     log(`Telegram 通知失败：${error.message}`);
@@ -1662,8 +1670,20 @@ async function readProfitRankingFromRecycle(page) {
 
   // 回到农场获取地块数
   await reenterFarmPage(page, '读取地块数量');
-  const farmStatus = await getFarmStatus(page);
-  const totalSlots = farmStatus.totalSlots || 1;  // 默认1块地
+  let farmStatus = await getFarmStatus(page);
+  let totalSlots = farmStatus.totalSlots;
+  if (!Number.isFinite(totalSlots) || totalSlots <= 0) {
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      log(`获取地块数失败（第 ${attempt}/10 次），重新读取农场状态...`);
+      await reenterFarmPage(page, '重新获取地块数');
+      farmStatus = await getFarmStatus(page);
+      totalSlots = farmStatus.totalSlots;
+      if (Number.isFinite(totalSlots) && totalSlots > 0) break;
+    }
+    if (!Number.isFinite(totalSlots) || totalSlots <= 0) {
+      throw new Error('连续 10 次无法获取地块数，无法计算种植收益');
+    }
+  }
 
   log(`当前地块数：${totalSlots}，基于此计算作物收益排名`);
 
@@ -1897,7 +1917,7 @@ async function clickQuickSellConfirm(page) {
 async function sellCropIfNeeded(page, cropName, options = {}) {
   await enterRecyclePage(page, `检查${cropName}库存`);
   const beforeHolding = await waitForCropHolding(page, cropName);
-  const keepStock = Number.isFinite(options.keepStock) ? options.keepStock : keepSeedStock;
+  const keepStock = options.keepStock;
   const sellQuantity = Number.isFinite(options.quantity)
     ? options.quantity
     : Math.max(0, beforeHolding - keepStock);
@@ -1990,15 +2010,28 @@ async function sellCropWithRetry(page, cropName, dynamicKeepStock) {
 
 async function sellHarvestedCropsWithRetry(page, cropNames, farmStatus) {
   const results = [];
-  // 动态获取保留种子数量：优先使用实际地块数，否则用配置值
-  const dynamicKeepStock = (farmStatus && Number.isFinite(farmStatus.totalSlots))
-    ? farmStatus.totalSlots
-    : keepSeedStock;
 
-  log(`售卖策略：保留 ${dynamicKeepStock} 个种子（${farmStatus?.totalSlots ? '根据地块数动态计算' : '使用配置默认值'}）`);
+  // 动态获取保留种子数量：必须获取实际地块数
+  let keepStock = farmStatus?.totalSlots;
+  if (!Number.isFinite(keepStock) || keepStock <= 0) {
+    let currentStatus = farmStatus;
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      log(`获取地块数失败（第 ${attempt}/10 次），重新读取农场状态...`);
+      await reenterFarmPage(page, '重新获取地块数');
+      currentStatus = await getFarmStatus(page);
+      keepStock = currentStatus.totalSlots;
+      if (Number.isFinite(keepStock) && keepStock > 0) break;
+    }
+    if (!Number.isFinite(keepStock) || keepStock <= 0) {
+      log('连续 10 次无法获取地块数，跳过本轮卖出。');
+      return results;
+    }
+  }
+
+  log(`售卖策略：保留 ${keepStock} 个种子（根据地块数动态计算）`);
 
   for (const cropName of cropNames) {
-    results.push(await sellCropWithRetry(page, cropName, dynamicKeepStock));
+    results.push(await sellCropWithRetry(page, cropName, keepStock));
   }
   return results;
 }

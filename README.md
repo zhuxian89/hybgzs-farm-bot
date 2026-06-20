@@ -80,8 +80,7 @@ tail -f logs/farm-watch.log
   "strategy": {
     "plantCrop": "auto",
     "maxSeedPrice": 8,
-    "recalcAfterSuccessfulPlantRounds": 6,
-    "keepSeedStock": 6
+    "recalcAfterSuccessfulPlantRounds": 6
   }
 }
 ```
@@ -96,7 +95,8 @@ tail -f logs/farm-watch.log
 - `strategy.plantCrop`：`auto` 自动选收益最高作物；也可以写 `南瓜`、`番茄` 等固定作物
 - `strategy.maxSeedPrice`：参与自动策略的图鉴种子价格上限
 - `strategy.recalcAfterSuccessfulPlantRounds`：成功种植多少轮后重算策略
-- `strategy.keepSeedStock`：卖出时每种作物保留多少个种子
+
+留种数 = 实际地块数（每块地留 1 个种），从农场页面动态读取，不可配置；读不到时重试最多 10 次。
 
 也可以只启动专用 Chrome，不执行农场流程：
 

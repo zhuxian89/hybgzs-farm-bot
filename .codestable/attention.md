@@ -45,4 +45,4 @@
 
 - 默认补种策略是 `auto`：按本地图鉴成本、交易所现价、产量和成熟时间计算每小时利润，普通作物且种子价格小于等于 `farm-config.json` 的 `strategy.maxSeedPrice` 才参与。
 - 自动策略只在成功种植达到 `strategy.recalcAfterSuccessfulPlantRounds` 后重算；重算周期内必须锁定当前作物，不得因为 UI 失败、库存或点击失败改种候选列表里的其他作物。轮数和上次排名保存在 `data/farm-state.json`。
-- 收获后只卖本轮收获作物，每种保留 `strategy.keepSeedStock` 个作为下次种子；不自动购买菜场作物。
+- 收获后只卖本轮收获作物，每种保留地块数个（每块地留 1 个种）作为下次种子；不自动购买菜场作物。

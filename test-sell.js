@@ -1,72 +1,48 @@
 #!/usr/bin/env node
 /**
- * 测试售卖功能
+ * 测试售卖功能 - 卖出1个指定作物
  * 使用方法: node test-sell.js [作物名]
  * 例如: node test-sell.js 南瓜
  */
 
-import CDP from 'chrome-remote-interface';
+import WebSocket from 'ws';
 
 const CDP_ORIGIN = 'http://127.0.0.1:9222';
-const RECYCLE_URL = 'https://farm.linux.do/recycle';
+const RECYCLE_URL = 'https://cdk.hybgzs.com/entertainment/farm/recycle';
 
-// 从 farm-bot.js 复制的必要函数
-async function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function log(message) {
+function log(message) {
   console.log(`[test-sell] ${message}`);
 }
 
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getTargetInfo() {
+  const response = await fetch(`${CDP_ORIGIN}/json`);
+  const targets = await response.json();
+  const pageTarget = targets.find(t => t.type === 'page');
+  if (!pageTarget) throw new Error('没有找到可用的页面标签');
+  return pageTarget;
+}
+
 class Page {
-  constructor(client) {
-    this.client = client;
-    this.ws = null;
+  constructor(ws) {
+    this.ws = ws;
     this.pending = new Map();
     this.nextId = 1;
   }
 
-  async connect() {
-    const { webSocketDebuggerUrl } = await this.client;
-    const WebSocket = (await import('ws')).default;
-    this.ws = new WebSocket(webSocketDebuggerUrl);
-
-    this.ws.on('message', (data) => {
-      const message = JSON.parse(data);
-      if (!message.id) return;
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      clearTimeout(pending.timer);
-      if (message.error) {
-        pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
-      } else {
-        pending.resolve(message.result || {});
-      }
-    });
-
-    await new Promise((resolve, reject) => {
-      this.ws.once('open', resolve);
-      this.ws.once('error', reject);
-    });
-
-    await this.send('Runtime.enable');
-    await this.send('Page.enable');
-  }
-
   async send(method, params = {}) {
     const id = this.nextId++;
-    const message = { id, method, params };
-
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`CDP command timeout: ${method}`));
-      }, 15000);
+        reject(new Error(`Timeout: ${method}`));
+      }, 30000);
 
       this.pending.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify(message));
+      this.ws.send(JSON.stringify({ id, method, params }));
     });
   }
 
@@ -76,29 +52,51 @@ class Page {
       returnByValue: true,
       awaitPromise: true
     });
-
     if (result.exceptionDetails) {
       throw new Error(result.exceptionDetails.exception?.description || 'Evaluation failed');
     }
-
     return result.result?.value;
+  }
+
+  async goto(url) {
+    await this.send('Page.navigate', { url });
+    await sleep(3000);
   }
 
   async bodyText() {
     return this.evaluate('document.body?.innerText || ""');
   }
+}
 
-  async goto(url) {
-    await this.send('Page.navigate', { url });
-    await sleep(2000);
-  }
+async function connectPage() {
+  const target = await getTargetInfo();
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
 
-  async close() {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-  }
+  return new Promise((resolve, reject) => {
+    ws.on('open', async () => {
+      const page = new Page(ws);
+
+      ws.on('message', (data) => {
+        const message = JSON.parse(data);
+        if (!message.id) return;
+        const pending = page.pending.get(message.id);
+        if (!pending) return;
+        page.pending.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.error) {
+          pending.reject(new Error(message.error.message));
+        } else {
+          pending.resolve(message.result || {});
+        }
+      });
+
+      await page.send('Runtime.enable');
+      await page.send('Page.enable');
+      resolve(page);
+    });
+
+    ws.on('error', reject);
+  });
 }
 
 async function clickByText(page, text, { exact = false, buttonOnly = false } = {}) {
@@ -106,7 +104,7 @@ async function clickByText(page, text, { exact = false, buttonOnly = false } = {
     const text = ${JSON.stringify(text)};
     const exact = ${exact};
     const buttonOnly = ${buttonOnly};
-    const normalize = (value) => (value || '').trim().replace(/\\s+/g, ' ');
+    const normalize = (v) => (v || '').trim().replace(/\\s+/g, ' ');
     const visible = (el) => {
       const style = getComputedStyle(el);
       const rect = el.getBoundingClientRect();
@@ -128,48 +126,24 @@ async function clickByText(page, text, { exact = false, buttonOnly = false } = {
   })()`);
 }
 
-async function enterRecyclePage(page) {
-  await page.goto(RECYCLE_URL);
-  log('等待交易所页面加载...');
-  await sleep(3000);
-}
-
-async function openQuickSellDialog(page) {
-  log('点击「快速卖出」按钮...');
-  const opened = await clickByText(page, '快速卖出', { exact: true, buttonOnly: true });
-  if (!opened) {
-    throw new Error('没有找到可点击的「快速卖出」按钮');
-  }
-  await sleep(2000);
-
-  const bodyText = await page.bodyText();
-  if (!bodyText.includes('勾选作物并调整数量')) {
-    throw new Error('快速卖出弹窗未正常打开');
-  }
-
-  log('快速卖出弹窗已打开');
-}
-
 async function readQuickSellCropSelection(page, cropName) {
   return page.evaluate(`(() => {
     const cropName = ${JSON.stringify(cropName)};
-    const normalize = (value) => (value || '').trim().replace(/\\s+/g, ' ');
+    const normalize = (v) => (v || '').trim().replace(/\\s+/g, ' ');
     const visible = (el) => {
       const style = getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
     };
 
-    const rows = Array.from(document.querySelectorAll('div, article, section')).filter(visible);
-    for (const row of rows) {
-      const text = normalize(row.innerText || row.textContent);
-      if (!text.startsWith(cropName)) continue;
-
-      const match = text.match(/库存\\s*(\\d+).*?已选\\s*(\\d+)/);
+    const nodes = Array.from(document.querySelectorAll('body *')).filter(visible);
+    for (const el of nodes) {
+      const text = normalize(el.innerText || el.textContent);
+      const match = text.match(new RegExp(cropName + '\\\\s+已选\\\\s+(\\\\d+)\\\\s*\\\\/\\\\s*库存\\\\s+(\\\\d+)'));
       if (match) {
         return {
-          stock: parseInt(match[1], 10),
-          selected: parseInt(match[2], 10)
+          selected: Number(match[1]),
+          stock: Number(match[2])
         };
       }
     }
@@ -178,109 +152,142 @@ async function readQuickSellCropSelection(page, cropName) {
 }
 
 async function setCropQuantityInQuickSell(page, cropName, quantity) {
-  log(`设置${cropName}卖出数量为 ${quantity}...`);
-
-  const result = await page.evaluate(`(() => {
+  return page.evaluate(`(() => {
     const cropName = ${JSON.stringify(cropName)};
-    const quantity = ${quantity};
+    const quantity = ${JSON.stringify(quantity)};
     const normalize = (value) => (value || '').trim().replace(/\\s+/g, ' ');
     const visible = (el) => {
       const style = getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
     };
+    const inputs = Array.from(document.querySelectorAll('input[type="number"]')).filter(visible);
 
-    const rows = Array.from(document.querySelectorAll('div, article, section')).filter(visible);
-    for (const row of rows) {
-      const text = normalize(row.innerText || row.textContent);
-      if (!text.startsWith(cropName)) continue;
+    // 找到最接近的、只包含目标作物的输入框
+    let bestMatch = null;
+    let shortestText = Infinity;
 
-      const inputs = Array.from(row.querySelectorAll('input[type="number"]')).filter(visible);
-      if (inputs.length) {
-        inputs[0].value = quantity;
-        inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-        inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-        return { selected: true };
+    for (const input of inputs) {
+      let cursor = input;
+      for (let depth = 0; cursor && depth < 8; depth += 1) {
+        const text = normalize(cursor.innerText || cursor.textContent);
+
+        // 必须包含作物名和库存
+        if (text.includes(cropName) && text.includes('库存')) {
+          // 检查是否包含其他作物（如果文本很长，可能包含多个作物）
+          const match = text.match(/库存\\s*(\\d+)/);
+          if (match) {
+            const stock = Number(match[1]);
+            // 优先选择文本最短的（最接近的父元素，只包含这个作物）
+            if (text.length < shortestText) {
+              shortestText = text.length;
+              bestMatch = { input, stock, text };
+            }
+          }
+        }
+        cursor = cursor.parentElement;
       }
     }
 
-    return { selected: false };
-  })()`);
-
-  if (!result.selected) {
-    throw new Error(`未找到${cropName}的数量输入框`);
-  }
-
-  await sleep(1000);
-}
-
-async function confirmQuickSell(page) {
-  log('点击「确认卖出」按钮...');
-  const clicked = await clickByText(page, '确认卖出', { exact: false, buttonOnly: true });
-  if (!clicked) {
-    throw new Error('没有找到「确认卖出」按钮');
-  }
-  await sleep(2000);
-}
-
-async function testSell(cropName) {
-  log(`开始测试售卖功能，作物: ${cropName}`);
-
-  const client = await CDP({ port: 9222 });
-  const page = new Page(client);
-
-  try {
-    await page.connect();
-    log('已连接到 Chrome');
-
-    // 1. 进入交易所
-    await enterRecyclePage(page);
-
-    // 2. 打开快速卖出弹窗
-    await openQuickSellDialog(page);
-
-    // 3. 读取当前库存
-    const before = await readQuickSellCropSelection(page, cropName);
-    if (!before) {
-      throw new Error(`未找到${cropName}，可能库存为 0 或作物名不正确`);
+    if (!bestMatch) {
+      return { selected: false, stock: null, quantity, reason: 'crop-input-not-found' };
     }
 
-    log(`${cropName} 当前库存: ${before.stock} 个`);
+    const { input, stock } = bestMatch;
+
+    if (quantity < 0 || quantity > stock) {
+      return { selected: false, stock, quantity, reason: 'quantity-out-of-range' };
+    }
+
+    input.scrollIntoView({ block: 'center', inline: 'center' });
+    input.focus();
+
+    // 清空
+    input.value = '';
+
+    // 触发 React 的 setter（关键！）
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    nativeInputValueSetter.call(input, String(quantity));
+
+    // 触发 React 的事件
+    const inputEvent = new Event('input', { bubbles: true });
+    input.dispatchEvent(inputEvent);
+
+    const changeEvent = new Event('change', { bubbles: true });
+    input.dispatchEvent(changeEvent);
+
+    input.blur();
+
+    return { selected: true, stock, quantity };
+  })()`);
+}
+
+async function main() {
+  const cropName = process.argv[2] || '南瓜';
+  log(`测试售卖功能：${cropName}，卖出 1 个`);
+
+  const page = await connectPage();
+  log('已连接到浏览器');
+
+  try {
+    // 1. 进入交易所
+    log('进入交易所页面...');
+    await page.goto(RECYCLE_URL);
+
+    const bodyText = await page.bodyText();
+    if (!bodyText.includes('快速卖出')) {
+      throw new Error('交易所页面未正常加载');
+    }
+
+    // 2. 点击快速卖出
+    log('点击「快速卖出」...');
+    const opened = await clickByText(page, '快速卖出', { exact: true, buttonOnly: true });
+    if (!opened) {
+      throw new Error('未找到「快速卖出」按钮');
+    }
+    await sleep(2000);
+
+    // 3. 读取库存
+    const before = await readQuickSellCropSelection(page, cropName);
+    if (!before) {
+      throw new Error(`未找到 ${cropName}，库存可能为 0`);
+    }
+    log(`${cropName} 库存: ${before.stock}，已选: ${before.selected}`);
 
     if (before.stock === 0) {
-      log('库存为 0，无法测试售卖');
+      log('库存为 0，无法测试');
       return;
     }
 
-    // 4. 设置卖出数量（卖出 1 个用于测试）
-    const sellQuantity = 1;
-    await setCropQuantityInQuickSell(page, cropName, sellQuantity);
+    // 4. 设置卖出 1 个
+    log('设置卖出数量为 1...');
+    const setResult = await setCropQuantityInQuickSell(page, cropName, 1);
+    if (!setResult.selected) {
+      throw new Error(`设置数量失败: ${setResult.reason}`);
+    }
+    log('✓ 设置完成');
 
-    // 5. 验证设置是否生效
-    await sleep(1000);
+    // 5. 等待更新（重要！）
+    log('等待页面更新（5秒）...');
+    await sleep(5000);
+
+    // 6. 验证
     const after = await readQuickSellCropSelection(page, cropName);
-    log(`设置后: 库存 ${after.stock}，已选 ${after.selected}`);
+    log(`验证: 库存 ${after.stock}，已选 ${after.selected}`);
 
-    if (after.selected !== sellQuantity) {
-      throw new Error(`数量设置失败，期望 ${sellQuantity}，实际 ${after.selected}`);
+    if (after.selected !== 1) {
+      throw new Error(`❌ 数量设置未生效！期望 1，实际 ${after.selected}`);
     }
 
-    // 6. 确认卖出
-    await confirmQuickSell(page);
-
-    log('✅ 售卖测试成功！');
+    log('✅ 测试成功！数量设置已生效');
+    log('提示：没有执行确认卖出，不会真的卖出');
 
   } catch (error) {
-    log(`❌ 售卖测试失败: ${error.message}`);
+    log(`❌ 测试失败: ${error.message}`);
     throw error;
   } finally {
-    await page.close();
+    page.ws.close();
   }
 }
 
-// 主函数
-const cropName = process.argv[2] || '南瓜';
-testSell(cropName).catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main().catch(console.error);
