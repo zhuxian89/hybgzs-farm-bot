@@ -23,6 +23,7 @@ const stepTimeoutMs = Number(farmConfig.timing.stepTimeoutMs);
 const manualTimeoutMs = Number(farmConfig.timing.manualTimeoutMs);
 const cdpCommandTimeoutMs = Number(farmConfig.timing.cdpCommandTimeoutMs);
 const watchMode = process.argv.includes('--watch');
+const rankOnlyMode = process.argv.includes('--rank-only');
 const testSellCropName = getArgValue('--test-sell');
 const testSellQuantity = parsePositiveIntegerArg('--quantity');
 const intervalMinutes = Number(farmConfig.timing.intervalMinutes);
@@ -138,31 +139,22 @@ function rankCropsByProfit(crops, exchangePrices, totalSlots = 1) {
       const sellPrice = exchangePrices[crop.name];
       if (!Number.isFinite(sellPrice)) return null;
 
-      // 新算法：每轮收获 = 产量 × 地块数，卖出 = 收获 - 留种
+      // 每轮收获 = 产量 × 地块数；卖出 = 收获 − 地块数（每块地留 1 个做种子，不花钱买种）
       const harvestPerRound = crop.yield * totalSlots;
-      const sellPerRound = harvestPerRound - totalSlots;  // 留种
-      const incomePerHour = sellPerRound * sellPrice;
+      const sellPerRound = harvestPerRound - totalSlots;
+      const incomePerRound = sellPerRound * sellPrice;
       const roundsPerDay = 24 / crop.growHours;
-      const dailyIncome = incomePerHour * roundsPerDay;
-
-      // 保留旧字段用于兼容（用于显示每小时利润）
-      const revenue = crop.yield * sellPrice;
-      const profit = revenue - crop.seedPrice;
-      const profitPerHour = profit / crop.growHours;
+      const dailyIncome = incomePerRound * roundsPerDay;
 
       return {
         ...crop,
         sellPrice,
         costPrice: crop.seedPrice,
-        revenue,
-        profit,
-        profitPerHour,
         roundsPerDay,
-        // 新增字段
         harvestPerRound,
         sellPerRound,
-        incomePerHour,
-        dailyIncome  // 实际每天收入（考虑留种）
+        incomePerRound,
+        dailyIncome
       };
     })
     .filter(Boolean)
@@ -217,8 +209,6 @@ function serializeRanking(ranking) {
     sellPrice: roundMoney(item.sellPrice),
     yield: item.yield,
     growHours: item.growHours,
-    profit: roundMoney(item.profit),
-    profitPerHour: roundMoney(item.profitPerHour),
     roundsPerDay: roundMoney(item.roundsPerDay),
     dailyIncome: roundMoney(item.dailyIncome)
   }));
@@ -289,7 +279,8 @@ async function notify(message) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const apiUrl = `https://proxy.201861.xyz/proxy/https://api.telegram.org/bot${token}/sendMessage`;
+    const response = await fetch(apiUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       signal: controller.signal,
@@ -1153,11 +1144,27 @@ async function ensureFarmPage(page) {
 async function clickHarvestButtonOnce(page) {
   return page.evaluate(`(() => {
     const buttons = Array.from(document.querySelectorAll('button')).filter((button) => {
-      const value = (button.innerText || button.textContent || '').trim().replace(/\\s+/g, ' ');
+      const value = (button.innerText || button.textContent || '').trim().replace(/\\\\s+/g, ' ');
       return value.includes('一键收获');
     });
     if (!buttons.length) return 'missing';
     const button = buttons[0];
+    if (button.disabled) return 'disabled';
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    button.click();
+    return 'clicked';
+  })()`);
+}
+
+async function clickOneKeyFarmingButton(page) {
+  return page.evaluate(`(() => {
+    const buttons = Array.from(document.querySelectorAll('button')).filter((button) => {
+      const value = (button.innerText || button.textContent || '').trim().replace(/\\\\s+/g, ' ');
+      return value.includes('一键务农');
+    });
+    if (!buttons.length) return 'missing';
+    const button = buttons[0];
+    // 禁用态表示当前不可务农，不能点击也不算执行
     if (button.disabled) return 'disabled';
     button.scrollIntoView({ block: 'center', inline: 'center' });
     button.click();
@@ -2149,24 +2156,58 @@ function formatDuration(ms) {
 
 async function main() {
   log(`连接专用 Chrome：${CDP_ORIGIN}`);
-  const releaseWatchLock = watchMode && !testSellCropName ? acquireWatchLock() : null;
-  let page = await getOrCreatePage();
+  const releaseWatchLock = watchMode && !testSellCropName && !rankOnlyMode ? acquireWatchLock() : null;
+  // rank-only 用独立新标签页，避免干扰正在运行的 --watch 进程
+  let page = rankOnlyMode ? await newPage(HOME_URL) : await getOrCreatePage();
   let forceFreshPage = false;
   let consecutiveFailures = 0;
 
   try {
-    if (testSellCropName) {
+    if (rankOnlyMode) {
+      const { exchangePrices, ranking, totalSlots } = await readProfitRankingFromRecycle(page);
+      log(`地块数：${totalSlots}`);
+      log(`实时行情：${JSON.stringify(exchangePrices)}`);
+      log(`实时利润排行（前 ${ranking.length}）：`);
+      ranking.forEach((item, index) => {
+        log(`${index + 1}. ${item.name} 现价$${roundMoney(item.sellPrice)} 产量${item.yield} ${item.growHours}h 每日${roundMoney(item.roundsPerDay)}轮 → 日收入 ${roundMoney(item.dailyIncome)}`);
+      });
+    } else if (testSellCropName) {
       await runSellDiagnostic(page, testSellCropName, testSellQuantity);
     } else if (watchMode) {
       log(`进入常驻模式：优先按作物剩余时间等待；解析不到时每 ${intervalMinutes} 分钟检查一次。按 Ctrl+C 停止。`);
 
-      // 启动心跳监测，频率只影响 Telegram Ping，不影响收获检查。
-      const heartbeatInterval = setInterval(async () => {
-        const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-        await notify(`🟢 心跳 Ping - ${now}`);
-      }, heartbeatMs);
+      // 启动定时检查：每20分钟检查一键务农，每3次(60分钟)发送一次心跳。
+      let checkCount = 0;
+      const farmCheckMs = 10 * 60 * 1000; // 10分钟检查一次一键务农
+      const heartbeatEveryN = 6; // 每6次检查发送一次心跳 (6 × 10 = 60分钟)
 
-      log(`心跳监测已启动：每 ${heartbeatMinutes} 分钟发送一次 Ping 到 Telegram`);
+      const farmCheckInterval = setInterval(async () => {
+        checkCount++;
+        const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+        const isHeartbeatTime = checkCount % heartbeatEveryN === 0;
+
+        // 检查一键务农按钮
+        if (page) {
+          try {
+            const farmResult = await clickOneKeyFarmingButton(page);
+            if (farmResult === 'clicked') {
+              log('定时检测：一键务农按钮已点击');
+              await sleep(3000); // 等待务农操作完成
+              await notify(`🌾 一键务农已执行 - ${now}`);
+              return; // 已发消息，跳过心跳检查
+            }
+            // missing（无按钮）或 disabled（当前不可务农），静默不发消息
+          } catch (e) {
+            log(`定时检测：一键务农检查失败 - ${e.message}`);
+          }
+        }
+        // 只在心跳时间且没有发送过务农消息时，才发心跳
+        if (isHeartbeatTime) {
+          await notify(`🟢 心跳 Ping - ${now}`);
+        }
+      }, farmCheckMs);
+
+      log(`定时检测已启动：每10分钟检查一键务农，每${heartbeatEveryN}次(60分钟)发送心跳`);
 
       try {
         while (true) {
@@ -2226,8 +2267,8 @@ async function main() {
           await sleep(delayMs);
         }
       } finally {
-        clearInterval(heartbeatInterval);
-        log('心跳监测已停止');
+        clearInterval(farmCheckInterval);
+        log('定时检测已停止');
       }
     } else {
       let result;

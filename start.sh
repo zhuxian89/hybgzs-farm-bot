@@ -11,6 +11,7 @@ sleep 2
 # 2. 清理锁文件
 echo "清理锁文件..."
 rm -f data/farm-watch.lock
+mkdir -p logs data
 
 # 3. 确认进程已停止
 if ps aux | grep -E "node.*farm-bot" | grep -v grep > /dev/null; then

@@ -7,3 +7,7 @@ data/farm-state.json
 data/farm-watch.lock
 logs/*.log
 farm-config.local.json
+
+# 工具工作区与会话记录（不入库）
+.mindfs/
+.codestable/

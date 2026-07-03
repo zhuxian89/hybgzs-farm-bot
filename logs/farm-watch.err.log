@@ -1,5 +1,0 @@
-[farm-bot] 本轮失败（连续 1 次）：重连失败，无法执行 Page.navigate: Unexpected server response: 500
-[farm-bot] 本轮失败（连续 2 次）：重连失败，无法执行 Page.navigate: Unexpected server response: 500
-[farm-bot] 本轮失败（连续 3 次）：重连失败，无法执行 Page.navigate: Unexpected server response: 500
-[farm-bot] 本轮失败（连续 4 次）：重连失败，无法执行 Page.navigate: Unexpected server response: 500
-[farm-bot] 本轮失败（连续 5 次）：重连失败，无法执行 Page.navigate: Unexpected server response: 500

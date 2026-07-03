@@ -31,7 +31,7 @@ const defaultConfig = {
   },
   strategy: {
     plantCrop: 'auto',
-    maxSeedPrice: 8,
+    maxSeedPrice: 7,
     recalcAfterSuccessfulPlantRounds: 6,
   }
 };
