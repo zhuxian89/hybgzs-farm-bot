@@ -11,3 +11,7 @@ farm-config.local.json
 # 工具工作区与会话记录（不入库）
 .mindfs/
 .codestable/
+
+# 诊断临时文件
+diagnose-plant.png
+scripts/diagnose-plant.mjs

@@ -1445,6 +1445,111 @@ function describeSellResults(results) {
   return results.map(describeSellResult).join('\n');
 }
 
+// ===== 每日汇总：常规运行一天通知一次（每天 09:00），异常仍即时告警 =====
+const dailyStats = {
+  since: Date.now(),
+  rounds: 0,
+  harvestRounds: 0,
+  plantRounds: 0,
+  plantCrops: {},
+  sellCrops: {},
+  farmOps: 0,
+  failures: 0,
+  lastStatus: null,
+  lastStrategy: null,
+};
+
+function resetDailyStats() {
+  dailyStats.since = Date.now();
+  dailyStats.rounds = 0;
+  dailyStats.harvestRounds = 0;
+  dailyStats.plantRounds = 0;
+  dailyStats.plantCrops = {};
+  dailyStats.sellCrops = {};
+  dailyStats.farmOps = 0;
+  dailyStats.failures = 0;
+  dailyStats.lastStatus = null;
+  dailyStats.lastStrategy = null;
+}
+
+// 累积一轮的运行结果到当日统计（不发送通知）
+function recordDailyRound(result) {
+  if (!result) return;
+  dailyStats.rounds += 1;
+  if (result.harvested) dailyStats.harvestRounds += 1;
+  if (result.planted && result.plantCrop) {
+    dailyStats.plantRounds += 1;
+    dailyStats.plantCrops[result.plantCrop] = (dailyStats.plantCrops[result.plantCrop] || 0) + 1;
+  }
+  if (Array.isArray(result.sellResults)) {
+    for (const r of result.sellResults) {
+      if (r && r.sold && r.cropName) {
+        dailyStats.sellCrops[r.cropName] = (dailyStats.sellCrops[r.cropName] || 0) + (r.quantity || 0);
+      }
+    }
+  }
+  if (result.status) dailyStats.lastStatus = result.status;
+  if (result.strategy) dailyStats.lastStrategy = result.strategy;
+}
+
+async function sendDailySummary() {
+  const now = new Date();
+  const since = new Date(dailyStats.since);
+  const fmt = (d) => d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+
+  // 卖出：按作物累积数量，金额用最近成交价估算
+  const sellEntries = Object.entries(dailyStats.sellCrops);
+  let sellTotal = 0;
+  const sellText = sellEntries.length
+    ? `${sellEntries.map(([name, qty]) => {
+        const price = Number(farmState.lastExchangePrices?.[name]) || 0;
+        sellTotal += qty * price;
+        return `${name} ${qty}个`;
+      }).join('、')}（约 $${roundMoney(sellTotal)}）`
+    : '未卖出';
+
+  const plantEntries = Object.entries(dailyStats.plantCrops);
+  const plantText = plantEntries.length
+    ? plantEntries.map(([name, cnt]) => `${name}×${cnt}`).join('、')
+    : '无';
+
+  const lines = [];
+  lines.push(`📊 每日汇总（${fmt(now)}）`);
+  lines.push(`统计时段：${fmt(since)} 至今 · 共 ${dailyStats.rounds} 轮`);
+  lines.push('─────────────');
+  lines.push(`🌱 收获：${dailyStats.harvestRounds} 轮`);
+  lines.push(`🌿 种植：${dailyStats.plantRounds} 轮（${plantText}）`);
+  lines.push(`💰 卖出：${sellText}`);
+  lines.push(`🌾 一键务农：${dailyStats.farmOps} 次`);
+  if (dailyStats.failures > 0) lines.push(`⚠️ 异常：${dailyStats.failures} 次`);
+  lines.push('─────────────');
+  const s = dailyStats.lastStatus;
+  if (s) {
+    lines.push(`当前作物：${dailyStats.lastStrategy?.selectedCrop || '未知'}`);
+    if (s.planted !== null && s.totalSlots !== null) lines.push(`已种植：${s.planted}/${s.totalSlots}`);
+    if (s.nextRemaining) lines.push(`下次收获：剩余 ${s.nextRemaining}`);
+  }
+  await notify(lines.join('\n'));
+  resetDailyStats();
+}
+
+let dailySummaryTimer = null;
+function scheduleDailySummary() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(9, 0, 0, 0); // 每天 09:00
+  if (next <= now) next.setDate(next.getDate() + 1); // 今天 09:00 已过则排到明天
+  dailySummaryTimer = setTimeout(async () => {
+    try {
+      await sendDailySummary();
+    } catch (e) {
+      log(`每日汇总发送失败：${e.message}`);
+    }
+    scheduleDailySummary(); // 安排下一天
+  }, next - now);
+  log(`每日汇总已安排：每天 09:00 发送，下次 ${formatNextRun(next)}`);
+}
+
 function recordSuccessfulPlant(cropName) {
   farmState.selectedCrop = cropName;
   farmState.plantedRoundsSinceRecalc = (Number(farmState.plantedRoundsSinceRecalc) || 0) + 1;
@@ -1553,14 +1658,16 @@ async function plantCropIfPossible(page, plantPlan) {
     throw new Error(`点击「${selectedCropName}」后没有等到种植数量控件，停止本轮，避免误种其他作物。`);
   }
 
-  if (!(await clickPlantMaxButton(page))) {
-    const status = await getFarmStatus(page);
-    if (!(await setPlantQuantityFallback(page, status.emptySlots))) {
-      throw new Error('没有可点击的「最大」按钮，也没有可设置的种植数量输入框。');
-    }
-    log(`未找到「最大」按钮，改为输入数量 ${status.emptySlots}。`);
-  } else {
+  if (await clickPlantMaxButton(page)) {
     log('点击「最大」。');
+  } else {
+    // 「最大」按钮不可点击：常见于仅 1 块空地（数量已默认为最大值，无需再点）。
+    const status = await getFarmStatus(page);
+    if (await setPlantQuantityFallback(page, status.emptySlots)) {
+      log(`未找到「最大」按钮，改为输入数量 ${status.emptySlots}。`);
+    } else {
+      log('「最大」按钮不可用且无数量输入框，使用默认数量直接确认。');
+    }
   }
 
   const confirmReady = await waitForPlantConfirmReady(page);
@@ -2176,38 +2283,27 @@ async function main() {
     } else if (watchMode) {
       log(`进入常驻模式：优先按作物剩余时间等待；解析不到时每 ${intervalMinutes} 分钟检查一次。按 Ctrl+C 停止。`);
 
-      // 启动定时检查：每20分钟检查一键务农，每3次(60分钟)发送一次心跳。
-      let checkCount = 0;
+      // 启动定时检查：每10分钟检查一键务农（累积到每日统计，不再即时通知）
       const farmCheckMs = 10 * 60 * 1000; // 10分钟检查一次一键务农
-      const heartbeatEveryN = 6; // 每6次检查发送一次心跳 (6 × 10 = 60分钟)
 
       const farmCheckInterval = setInterval(async () => {
-        checkCount++;
-        const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-        const isHeartbeatTime = checkCount % heartbeatEveryN === 0;
-
-        // 检查一键务农按钮
         if (page) {
           try {
             const farmResult = await clickOneKeyFarmingButton(page);
             if (farmResult === 'clicked') {
               log('定时检测：一键务农按钮已点击');
               await sleep(3000); // 等待务农操作完成
-              await notify(`🌾 一键务农已执行 - ${now}`);
-              return; // 已发消息，跳过心跳检查
+              dailyStats.farmOps += 1;
             }
-            // missing（无按钮）或 disabled（当前不可务农），静默不发消息
+            // missing（无按钮）或 disabled（当前不可务农），静默处理
           } catch (e) {
             log(`定时检测：一键务农检查失败 - ${e.message}`);
           }
         }
-        // 只在心跳时间且没有发送过务农消息时，才发心跳
-        if (isHeartbeatTime) {
-          await notify(`🟢 心跳 Ping - ${now}`);
-        }
       }, farmCheckMs);
 
-      log(`定时检测已启动：每10分钟检查一键务农，每${heartbeatEveryN}次(60分钟)发送心跳`);
+      log(`定时检测已启动：每10分钟检查一键务农`);
+      scheduleDailySummary();
 
       try {
         while (true) {
@@ -2223,6 +2319,7 @@ async function main() {
           } catch (error) {
             failed = true;
             consecutiveFailures += 1;
+            dailyStats.failures += 1;
             console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
 
             // 判断错误类型
@@ -2262,12 +2359,13 @@ async function main() {
           const nextRunAt = new Date(Date.now() + delayMs);
           log(`等待下一轮：${formatDuration(delayMs)}后，${formatNextRun(nextRunAt)}`);
           if (result) {
-            await notify(`本轮检查完成。\n收获：${result.harvested ? '成功' : '本轮无可收获'}\n种植：${result.planted ? `成功种植${result.plantCrop}` : result.noCrop ? `候选作物无库存，等待补货` : '本轮未种植'}\n卖出：${describeSellResults(result.sellResults)}\n${describeStrategy(result.strategy)}\n${describeFarmStatus(result.status)}\n下次检查：${formatNextRun(nextRunAt)}`);
+            recordDailyRound(result);
           }
           await sleep(delayMs);
         }
       } finally {
         clearInterval(farmCheckInterval);
+        if (dailySummaryTimer) clearTimeout(dailySummaryTimer);
         log('定时检测已停止');
       }
     } else {
