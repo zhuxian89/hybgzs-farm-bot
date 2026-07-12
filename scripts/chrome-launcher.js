@@ -34,6 +34,7 @@ export function launchDedicatedChrome({ port = '9222', url = 'https://cdk.hybgzs
   const args = [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${chromeProfileDir}`,
+    '--headless=new',
     '--no-first-run',
     '--no-default-browser-check',
     url
