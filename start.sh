@@ -1,53 +1,37 @@
 #!/bin/bash
-# 安全启动 farm-bot
-# 注意：防休眠由独立 launchd 服务负责（见 setup-caffeinate.sh），不再与 bot 绑定。
-# 这样 farm-bot 重启/崩溃/停止都不会让 Mac 休眠，远程始终可达。
+# 在 launchd 下（重启）farm-bot。
+# bot 由 com.hybgzs.farm-bot（KeepAlive）托管，本脚本等同于 launchctl kickstart -k。
+# 首次部署请先运行：./setup-farm-bot.sh
+# 防休眠由独立服务 com.hybgzs.caffeinate 负责，与本脚本无关。
 
 set -e
 
-# 1. 停止现有 farm-bot 进程
-echo "停止现有 farm-bot 进程..."
-pkill -f "farm-bot.js" 2>/dev/null || true
+LABEL="com.hybgzs.farm-bot"
+DOMAIN="gui/$(id -u)"
+
+# 服务未注册则提示先部署
+if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "⚠️  $LABEL 未注册。首次请先运行：./setup-farm-bot.sh"
+    exit 1
+fi
+
+# 在 launchd 下重启 bot（-k：先杀当前实例再立即重启）
+launchctl kickstart -k "$DOMAIN/$LABEL"
 sleep 2
 
-# 2. 清理锁文件
-echo "清理锁文件..."
-rm -f data/farm-watch.lock
-mkdir -p logs data
-
-# 3. 确认进程已停止
-if ps aux | grep -E "node.*farm-bot" | grep -v grep > /dev/null; then
-    echo "错误：仍有 farm-bot 进程在运行"
-    ps aux | grep -E "node.*farm-bot" | grep -v grep
-    exit 1
-fi
-
-# 4. 启动 farm-bot（防休眠不在此处，由独立 caffeinate 服务保证 Mac 不睡）
-echo "启动 farm-bot..."
-nohup node scripts/farm-bot.js --watch > logs/farm-watch.log 2> logs/farm-watch.err.log &
-
-sleep 3
-
-# 5. 验证主进程
-echo "验证启动状态..."
-MAIN_PROCESSES=$(ps aux | grep -E "node.*farm-bot" | grep -v grep | wc -l | tr -d ' ')
-echo "主进程数: $MAIN_PROCESSES"
-
-if [ "$MAIN_PROCESSES" -ne 1 ]; then
-    echo "❌ 错误：主进程数量不正确（期望1个，实际${MAIN_PROCESSES}个）"
-    ps aux | grep -E "node.*farm-bot" | grep -v grep
-    exit 1
-fi
-
-MAIN_PID=$(ps aux | grep -E "node.*farm-bot" | grep -v grep | awk '{print $2}')
-
-# 6. 检查防休眠服务（仅提示，不阻断启动）
-if pgrep -f "caffeinate -dimsu" > /dev/null 2>&1; then
-    echo "✅ 启动成功"
-    echo "   主进程: PID $MAIN_PID"
-    echo "   防休眠: ✅ 独立 caffeinate 运行中（与 bot 解耦）"
+PID="$(pgrep -f 'node.*farm-bot.js --watch' | head -1)"
+if [ -n "$PID" ]; then
+    echo "✅ farm-bot 已在 launchd 下重启，PID $PID"
+    echo "   状态: launchctl print $DOMAIN/$LABEL"
+    echo "   日志: tail -f logs/farm-watch.log"
 else
-    echo "✅ farm-bot 启动成功 (PID $MAIN_PID)"
-    echo "   ⚠️  防休眠未运行！Mac 可能休眠导致远程断连"
-    echo "   请执行: ./setup-caffeinate.sh"
+    echo "❌ 重启后未发现进程，请检查 launchctl print $DOMAIN/$LABEL 与 logs/farm-watch.err.log"
+    exit 1
+fi
+
+# 防休眠提示（非阻断）
+if pgrep -f "caffeinate -dimsu" >/dev/null 2>&1; then
+    echo "   防休眠: ✅ caffeinate 运行中"
+else
+    echo "   ⚠️  防休眠未运行，请运行：./setup-caffeinate.sh"
 fi

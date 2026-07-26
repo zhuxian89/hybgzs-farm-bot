@@ -14,7 +14,12 @@
 ### 运行与本地起服务
 
 - 单次农场流程：`npm run farm`。
-- 常驻农场流程：`npm run farm:watch`。
+- 常驻农场流程（生产）：由 launchd 服务 `com.hybgzs.farm-bot` 托管（`KeepAlive` 崩溃自愈 + `RunAtLoad` 登录自启）。首次部署 `./setup-farm-bot.sh`，重启 `./start.sh`（= `launchctl kickstart -k`）。
+- `npm run farm:watch` 仍可用于手动/临时前台运行，但不是受监督的生产路径（崩溃不会自动重启）。
+- bot 进程由 launchd 保活；防休眠由独立服务 `com.hybgzs.caffeinate` 负责，两者分立，不要合并。
+- ⚠️ `setup-farm-bot.sh` 会把当时 `command -v node` 的绝对路径烘焙进 plist；**node 升级或项目搬家后必须重跑 `./setup-farm-bot.sh`**，否则 launchd 起不来。
+- 锁文件 `data/farm-watch.lock` 已处理死 PID（`acquireWatchLock` 检测持有者进程不在则覆盖），launchd 重启不会因残留锁死循环。
+- ⚠️ launchd 以 **append** 方式写 `logs/farm-watch.{log,err.log}`（不像旧 `start.sh` 的 `>` 每次截断），且 KeepAlive 重拉反复追加——**日志不会自动轮转**，长期运行须定期手动清空（`> logs/farm-watch.log`）或加外置轮转。
 - 脚本通过 Chrome DevTools Protocol 连接专用 Chrome，默认端口 `9222`。
 - 脚本会自动启动专用 Chrome，profile 位于 `chrome-profile/`。
 
