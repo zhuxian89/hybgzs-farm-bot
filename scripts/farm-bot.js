@@ -305,6 +305,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isCdpTargetError(error) {
+  const message = error?.message || String(error || '');
+  return /CDP|WebSocket|重连失败|Unexpected server response|Target is closing|Page\.navigate 失败/.test(message);
+}
+
 async function waitUntil(description, predicate, timeout = stepTimeoutMs, interval = 500) {
   const startedAt = Date.now();
   let lastError = null;
@@ -313,6 +318,7 @@ async function waitUntil(description, predicate, timeout = stepTimeoutMs, interv
     try {
       if (await predicate()) return;
     } catch (error) {
+      if (isCdpTargetError(error)) throw error;
       lastError = error;
     }
     await sleep(interval);
@@ -329,6 +335,7 @@ async function waitHumanUi(description, predicate, { attempts = uiWaitAttempts, 
       const result = await predicate(attempt);
       if (result !== false && result !== null && result !== undefined) return result;
     } catch (error) {
+      if (isCdpTargetError(error)) throw error;
       lastError = error;
     }
 
@@ -405,10 +412,16 @@ class CdpPage {
     this.allowedSpendConfirm = null;
     this.unusable = false;
     this.reconnecting = false;
+    this.reconnectPromise = null;
+    this.closed = false;
     this.heartbeatInterval = null;
   }
 
   async connect() {
+    if (this.closed) {
+      throw new Error('CDP 页面已关闭，不能重新连接');
+    }
+
     // 清理旧的心跳
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
@@ -479,7 +492,7 @@ class CdpPage {
 
     // 启动心跳保活（每 30 秒）
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
+      if (this.ws?.readyState === WebSocket.OPEN && this.pending.size === 0 && !this.reconnecting && !this.unusable && !this.closed) {
         this.send('Browser.getVersion').catch(() => {
           log('心跳失败，WebSocket 可能已断开');
         });
@@ -490,49 +503,64 @@ class CdpPage {
   }
 
   async reconnect() {
-    if (this.reconnecting) {
-      log('重连已在进行中，跳过');
-      return;
+    if (this.closed) {
+      throw new Error('CDP 页面已关闭，不能重连');
+    }
+    if (this.unusable) {
+      throw new Error('CDP 页面已标记为不可用，需要创建新标签页');
+    }
+    if (this.reconnectPromise) {
+      log('重连已在进行中，等待现有重连完成');
+      return this.reconnectPromise;
     }
 
     this.reconnecting = true;
     log('WebSocket 断开，尝试重连...');
 
-    try {
-      // 清理旧连接
-      if (this.ws) {
-        this.ws.removeAllListeners();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.close();
+    this.reconnectPromise = (async () => {
+      try {
+        this.rejectAllPending(new Error('CDP WebSocket 正在重连'));
+        if (this.ws) {
+          this.ws.removeAllListeners();
+          if (this.ws.readyState === WebSocket.OPEN) {
+            this.ws.close();
+          }
         }
+
+        await sleep(1000);
+        if (this.closed || this.unusable) {
+          throw new Error('CDP 页面在重连期间已失效');
+        }
+
+        await this.connect();
+        log('WebSocket 重连成功');
+      } catch (error) {
+        log(`WebSocket 重连失败: ${error.message}`);
+        throw error;
       }
+    })();
 
-      // 等待一小段时间
-      await sleep(1000);
-
-      // 重新连接
-      await this.connect();
-      this.unusable = false;
-      log('WebSocket 重连成功');
-    } catch (error) {
-      log(`WebSocket 重连失败: ${error.message}`);
-      throw error;
+    try {
+      return await this.reconnectPromise;
     } finally {
       this.reconnecting = false;
+      this.reconnectPromise = null;
     }
   }
 
   async send(method, params = {}) {
-    // 如果未连接，尝试重连
+    if (this.closed) {
+      return Promise.reject(new Error(`CDP 页面已关闭，无法执行 ${method}`));
+    }
+    if (this.unusable) {
+      return Promise.reject(new Error(`CDP 页面不可用，无法执行 ${method}，需要创建新标签页`));
+    }
+
     if (this.ws?.readyState !== WebSocket.OPEN) {
-      if (!this.reconnecting) {
-        try {
-          await this.reconnect();
-        } catch (error) {
-          return Promise.reject(new Error(`重连失败，无法执行 ${method}: ${error.message}`));
-        }
-      } else {
-        return Promise.reject(new Error(`WebSocket 重连中，暂时无法执行 ${method}`));
+      try {
+        await this.reconnect();
+      } catch (error) {
+        return Promise.reject(new Error(`重连失败，无法执行 ${method}: ${error.message}`));
       }
     }
 
@@ -600,7 +628,10 @@ class CdpPage {
   }
 
   async goto(url) {
-    await this.send('Page.navigate', { url });
+    const navigation = await this.send('Page.navigate', { url });
+    if (navigation.errorText) {
+      throw new Error(`Page.navigate 失败：${navigation.errorText}`);
+    }
     // 注意：这里只等待 DOM readyState，不等待 SPA 业务内容渲染
     // 调用者必须额外调用业务页面的 ready 检查函数：
     // - FARM_URL → waitForFarmReady()
@@ -640,10 +671,22 @@ class CdpPage {
   }
 
   async close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.unusable = true;
     await this.disconnect();
     if (this.targetId) {
-      await fetchJson(`${CDP_ORIGIN}/json/close/${this.targetId}`).catch((error) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      await fetch(`${CDP_ORIGIN}/json/close/${this.targetId}`, { signal: controller.signal }).then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`关闭 target 返回 HTTP ${response.status}`);
+        }
+        await response.text();
+      }).catch((error) => {
         log(`关闭 Chrome 标签页失败：${error.message}`);
+      }).finally(() => {
+        clearTimeout(timer);
       });
     }
   }
@@ -937,11 +980,16 @@ async function isCropSelectedForPlanting(page, cropName) {
 }
 
 async function getPageState(page) {
-  const [title, url, bodyText] = await Promise.all([
-    page.title().catch(() => ''),
-    page.url().catch(() => ''),
-    page.bodyText().catch(() => '')
+  const results = await Promise.allSettled([
+    page.title(),
+    page.url(),
+    page.bodyText()
   ]);
+  const errors = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+  if (errors.length === results.length) {
+    throw errors[0];
+  }
+  const [title, url, bodyText] = results.map((result) => result.status === 'fulfilled' ? result.value : '');
 
   if (SECURITY_TEXT_PATTERN.test(title) || SECURITY_TEXT_PATTERN.test(bodyText)) {
     return { type: 'security', title, url, bodyText };
@@ -1088,10 +1136,19 @@ async function ensureDashboardOrFarmPage(page) {
   await page.goto(HOME_URL);
   await dismissNotice(page);
 
-  await waitUntil('主页加载或进入登录/安全验证状态', async () => {
-    const state = await getPageState(page);
-    return ['security', 'google-password', 'home-login', 'linuxdo-login', 'google-consent', 'auth', 'dashboard', 'farm'].includes(state.type);
-  }, 30000);
+  let lastState = null;
+  try {
+    await waitUntil('主页加载或进入登录/安全验证状态', async () => {
+      lastState = await getPageState(page);
+      return ['security', 'google-password', 'home-login', 'linuxdo-login', 'google-consent', 'auth', 'dashboard', 'farm'].includes(lastState.type);
+    }, 30000);
+  } catch (error) {
+    if (lastState?.type === 'unknown') {
+      const bodySnippet = (lastState.bodyText || '').trim().replace(/\s+/g, ' ').slice(0, 160);
+      log(`主页状态无法识别：url=${lastState.url || '(empty)'}，title=${lastState.title || '(empty)'}，body=${bodySnippet || '(empty)'}`);
+    }
+    throw error;
+  }
 
   let state = await getPageState(page);
   for (let attempt = 0; attempt < 6 && state.type !== 'dashboard' && state.type !== 'farm'; attempt += 1) {
@@ -1130,6 +1187,21 @@ async function reenterFarmPage(page, reason) {
 }
 
 async function ensureFarmPage(page) {
+  // 优先直接打开农场页：绝大多数情况下 session 有效，省去首页加载与点击入口的开销
+  try {
+    await page.goto(FARM_URL);
+    await waitForFarmReady(page);
+    if (await isFarmReady(page)) {
+      log('已进入农场主体页面。');
+      return;
+    }
+    log('直接进入农场未就绪，回退首页登录流程重试。');
+  } catch (error) {
+    if (isCdpTargetError(error)) throw error;
+    log(`直接进入农场失败，回退首页登录流程：${error.message}`);
+  }
+
+  // 回退：经首页登录流程后点击入口进入农场
   await ensureDashboardOrFarmPage(page);
   await clickFarmEntry(page);
   await waitForFarmReady(page);
@@ -2285,9 +2357,20 @@ async function main() {
 
       // 启动定时检查：每10分钟检查一键务农（累积到每日统计，不再即时通知）
       const farmCheckMs = 10 * 60 * 1000; // 10分钟检查一次一键务农
+      let pageOperationTail = Promise.resolve();
+      let farmCheckQueued = false;
 
-      const farmCheckInterval = setInterval(async () => {
-        if (page) {
+      const withPageOperation = (operation) => {
+        const current = pageOperationTail.then(operation, operation);
+        pageOperationTail = current.catch(() => {});
+        return current;
+      };
+
+      const farmCheckInterval = setInterval(() => {
+        if (farmCheckQueued) return;
+        farmCheckQueued = true;
+        withPageOperation(async () => {
+          if (!page) return;
           try {
             const farmResult = await clickOneKeyFarmingButton(page);
             if (farmResult === 'clicked') {
@@ -2298,8 +2381,16 @@ async function main() {
             // missing（无按钮）或 disabled（当前不可务农），静默处理
           } catch (e) {
             log(`定时检测：一键务农检查失败 - ${e.message}`);
+            if (isCdpTargetError(e)) {
+              await page?.close().catch(() => {});
+              page = null;
+              forceFreshPage = true;
+              log('定时检测已清理失效页面，下一轮将创建新标签页');
+            }
           }
-        }
+        }).finally(() => {
+          farmCheckQueued = false;
+        });
       }, farmCheckMs);
 
       log(`定时检测已启动：每10分钟检查一键务农`);
@@ -2309,51 +2400,47 @@ async function main() {
         while (true) {
           let result = null;
           let failed = false;
-          try {
-            if (!page) {
-              page = await getOrCreatePage({ fresh: forceFreshPage });
-              forceFreshPage = false;
-            }
-            result = await runFarmOnce(page);
-            consecutiveFailures = 0;
-          } catch (error) {
-            failed = true;
-            consecutiveFailures += 1;
-            dailyStats.failures += 1;
-            console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
+          await withPageOperation(async () => {
+            try {
+              if (!page) {
+                page = await getOrCreatePage({ fresh: forceFreshPage });
+                forceFreshPage = false;
+              }
+              result = await runFarmOnce(page);
+              consecutiveFailures = 0;
+            } catch (error) {
+              failed = true;
+              consecutiveFailures += 1;
+              dailyStats.failures += 1;
+              console.error(`[farm-bot] 本轮失败（连续 ${consecutiveFailures} 次）：${error.message}`);
 
-            // 判断错误类型
-            const isWebSocketError = error.message.includes('WebSocket') || error.message.includes('CDP');
-            const isPageError = error.message.includes('等待超时') || error.message.includes('未找到');
+              const isTargetError = isCdpTargetError(error);
+              const isPageError = error.message.includes('等待超时') || error.message.includes('未找到');
 
-            if (isWebSocketError && consecutiveFailures < 3) {
-              // WebSocket 错误：尝试重连，不关闭页面
-              log('检测到 WebSocket 错误，尝试重连而不创建新标签页');
-              try {
-                await page?.reconnect();
-                log('WebSocket 重连成功，将在下一轮继续使用当前页面');
-                // 不设置 forceFreshPage，继续使用当前页面
-              } catch (reconnectError) {
-                log(`WebSocket 重连失败: ${reconnectError.message}，将创建新标签页`);
+              if (isTargetError) {
+                log('CDP 页面连接已失效，关闭旧标签页并在下一轮创建新标签页');
                 await page?.close().catch(() => {});
                 page = null;
                 forceFreshPage = true;
-              }
-            } else if (consecutiveFailures >= 5) {
-              // 连续失败 5 次：创建新标签页
-              log('连续失败 5 次，创建新标签页重新开始');
-              await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n创建新标签页重新开始`);
-              await page?.close().catch(() => {});
-              page = null;
-              forceFreshPage = true;
-            } else {
-              // 其他错误或少量失败：保留页面，下一轮重试
-              log(`保留当前页面，${failureRetrySeconds} 秒后重试`);
-              if (consecutiveFailures >= 3) {
-                await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n保留当前页面，继续重试`);
+              } else if (isPageError && consecutiveFailures >= 2) {
+                log(`页面连续失败 ${consecutiveFailures} 次，关闭旧标签页并在下一轮创建新标签页`);
+                await page?.close().catch(() => {});
+                page = null;
+                forceFreshPage = true;
+              } else if (consecutiveFailures >= 5) {
+                log(`连续失败 ${consecutiveFailures} 次，创建新标签页重新开始`);
+                await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n创建新标签页重新开始`);
+                await page?.close().catch(() => {});
+                page = null;
+                forceFreshPage = true;
+              } else {
+                log(`保留当前页面，${failureRetrySeconds} 秒后重试`);
+                if (consecutiveFailures >= 3) {
+                  await notify(`连续失败 ${consecutiveFailures} 次：${error.message}\n保留当前页面，继续重试`);
+                }
               }
             }
-          }
+          });
 
           const delayMs = getNextDelayMs(result?.status, { failed, noCrop: result?.noCrop });
           const nextRunAt = new Date(Date.now() + delayMs);
