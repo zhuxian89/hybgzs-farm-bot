@@ -3,6 +3,7 @@ doc_type: issue-fix
 issue: 2026-06-13-farm-bot-flow-recovery
 path: standard
 fix_date: 2026-06-13
+updated: 2026-07-17
 related: [farm-bot-flow-recovery-analysis.md]
 tags: [farm-bot, cdp, recovery, telegram]
 ---
@@ -29,6 +30,8 @@ CDP 卡顿恢复补充：`Runtime.evaluate` / `Page.navigate` 等 CDP 命令超�
 
 UI 等待节奏补充：dashboard、农场主体、一键收获按钮、收获后可继续种植状态不再使用高频短轮询或一失败就刷新。关键 UI 判断统一改为按人类操作节奏等待：每 5 秒检查一次，最多 5 次；25 秒内仍没有预期界面，才进入重新打开/重新进入农场的恢复逻辑。无可收获时不会额外等待一键收获按钮，避免空跑轮次被拖慢。
 
+2026-07-17 并发恢复回归修复：主流程、30 秒 CDP 心跳和 10 分钟一键务农检查此前会并发操作同一个页面 target；任一 CDP 命令超时都会关闭共享 WebSocket，后台任务随后可能重连正在关闭的 target，形成 `Page.navigate` / `Runtime.evaluate` 超时、WebSocket 500 和反复新建标签页的级联故障。本次将 watch 主流程与一键务农检查放入同一操作队列，心跳只在没有 pending 命令时发送；CDP target 超时后立即标记不可用并换新标签页，已关闭 target 禁止重连，后台检查发现 target 失效时也会在持锁状态下清理旧页面。同时让并发重连等待同一个 Promise，并按纯文本处理 Chrome `/json/close` 响应，消除 `Target is closing` 被误报为 JSON 解析失败的问题。通用等待器遇到 CDP target 错误会立即退出，不再把通信故障继续等待成普通 UI 超时。
+
 ## 2. 改动文件清单
 
 - `scripts/farm-bot.js`
@@ -49,6 +52,9 @@ UI 等待节奏补充：dashboard、农场主体、一键收获按钮、收获�
 - 收获后继续种植路径修正：已移除过严的 `waitForHarvestApplied` 成功判定，改为一键收获后重进农场并等待可继续种植的真实状态；统计卡片短暂未更新时会重进复查，不再把已成功的收获误报为失败。验证出可种植状态后会先发 TG，再继续执行玉米种植。
 - 种植重试与通知降噪：`plantCornIfPossible` 内部不再对普通种植失败直接发 TG，外层新增最多 3 次种植重试，每次重试都会重新进入农场；全部失败后才抛出最终错误，由 watch 的本轮失败通知统一发送。
 - 页面渲染等待修正：新增统一的 `waitHumanUi`，将 dashboard 入口、farm 主体、农场统计、一键收获按钮、收获后空闲槽位等待改成 5 秒一轮、最多 5 轮；只有连续 5 轮都没有预期 UI 才刷新/重进，避免肉眼已看到按钮但脚本过早 DOM 判断失败导致频繁刷新。
+- 2026-07-17 回归验证：`node --check scripts/farm-bot.js`、`git diff --check`、`npm ls --depth=0` 均通过。
+- 2026-07-17 真实单轮验证：停止旧 watch 后运行 `npm run farm`，脚本成功连接保留登录态的专用 Chrome，进入农场，确认一键收获不可用且 16 块地没有空闲槽位，正常完成并断开心跳，没有重复种植或新增错误。
+- 2026-07-17 常驻验证：使用新代码重启 watch，首轮成功进入农场并确认没有空闲槽位，正常安排下一轮；新进程由 `launchctl` 托管，独立 `caffeinate -dimsu` 仍在运行，错误日志没有新增记录。
 - CodeStable 检索：report 和 analysis 均可通过 `.codestable/tools/search-yaml.py` 检索。
 
 ## 4. 遗留事项
